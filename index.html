@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>Голосовая мысль — Радуга</title>
+  <style>
+    :root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#21364d;background:#f3f7fb}
+    *{box-sizing:border-box}body{margin:0}main{min-height:100vh;display:grid;place-items:center;padding:18px}.card{width:min(420px,100%);padding:22px;border:1px solid #d4e0ec;border-radius:20px;background:#fff;box-shadow:0 20px 60px rgba(30,55,80,.14);text-align:center}.mic{font-size:58px}h1{margin:8px 0 5px;font-size:22px}.note{margin:0 0 18px;color:#718298;font-size:13px;line-height:1.45}.status{min-height:44px;margin:12px 0;padding:10px;border-radius:11px;background:#f4f7fa;color:#63768c;font-size:12px;line-height:1.4}.status.good{background:#eef9f2;color:#276d47}.status.bad{background:#fff0ee;color:#9a3d34}.actions{display:grid;grid-template-columns:1fr 1fr;gap:8px}.btn{min-height:46px;border-radius:11px;font-weight:850;cursor:pointer}.primary{grid-column:1/-1;border:0;background:#2e6db3;color:#fff}.secondary{border:1px solid #ccd8e5;background:#fff;color:#52667e}.recording{background:#b33b31!important}.hint{margin-top:14px;color:#8794a5;font-size:10px;line-height:1.45}
+  </style>
+</head>
+<body>
+<main><section class="card">
+  <div class="mic">🎙</div>
+  <h1>Голосовая мысль</h1>
+  <p class="note">Отдельная HTTPS-страница записи. Микрофон запрашивается здесь, вне Google Apps Script.</p>
+  <div id="status" class="status">Готово к записи.</div>
+  <div class="actions">
+    <button id="main" class="btn primary" type="button">Начать запись</button>
+    <button id="cancel" class="btn secondary" type="button">Отмена</button>
+    <button id="retry" class="btn secondary" type="button">Проверить микрофон</button>
+  </div>
+  <div class="hint">После остановки запись автоматически вернётся в CRM для распознавания. Аудиофайл здесь не сохраняется.</div>
+</section></main>
+<script>
+(function(){
+  'use strict';
+  const params=new URLSearchParams(location.search);
+  const session=String(params.get('session')||'');
+  const openerOriginHint=String(params.get('origin')||'');
+  const st=document.getElementById('status');
+  const main=document.getElementById('main');
+  const cancel=document.getElementById('cancel');
+  const retry=document.getElementById('retry');
+  let stream=null,recorder=null,chunks=[];
+
+  function setStatus(text,kind){st.textContent=text;st.className='status '+(kind||'');}
+  function stopTracks(){if(stream){try{stream.getTracks().forEach(track=>track.stop());}catch(e){}stream=null;}}
+  function targetOrigin(){return /^https:\/\//.test(openerOriginHint)?openerOriginHint:'*';}
+  function send(payload){if(!window.opener)throw new Error('CRM-окно не найдено');window.opener.postMessage(Object.assign({session:session},payload),targetOrigin());}
+
+  async function ensureMic(){
+    if(stream&&stream.active)return stream;
+    if(!window.isSecureContext||!navigator.mediaDevices||typeof navigator.mediaDevices.getUserMedia!=='function')throw new Error('Браузер не дал защищённый доступ к микрофону');
+    stream=await navigator.mediaDevices.getUserMedia({audio:true});
+    return stream;
+  }
+
+  async function start(){
+    main.disabled=true;setStatus('Запрашиваю микрофон…','');
+    try{
+      await ensureMic();
+      let options={};
+      if(window.MediaRecorder&&MediaRecorder.isTypeSupported&&MediaRecorder.isTypeSupported('audio/webm;codecs=opus'))options={mimeType:'audio/webm;codecs=opus'};
+      recorder=Object.keys(options).length?new MediaRecorder(stream,options):new MediaRecorder(stream);
+      chunks=[];
+      recorder.ondataavailable=e=>{if(e.data&&e.data.size)chunks.push(e.data);};
+      recorder.onstop=finish;
+      recorder.start();
+      main.disabled=false;main.textContent='Остановить и отправить';main.classList.add('recording');
+      setStatus('Запись идёт…','good');
+    }catch(error){
+      main.disabled=false;main.textContent='Начать запись';main.classList.remove('recording');
+      setStatus('Микрофон недоступен: '+(error&&error.message?error.message:error)+'. Разреши микрофон для этого сайта и повтори.','bad');
+    }
+  }
+
+  function finish(){
+    const mime=(recorder&&recorder.mimeType)||'audio/webm';
+    const blob=new Blob(chunks,{type:mime});
+    recorder=null;chunks=[];stopTracks();
+    if(!blob.size){setStatus('Запись пустая. Повтори ещё раз.','bad');return;}
+    setStatus('Возвращаю запись в CRM…','good');
+    const reader=new FileReader();
+    reader.onloadend=function(){
+      const raw=String(reader.result||'');
+      const base64=raw.includes(',')?raw.split(',')[1]:raw;
+      try{
+        send({type:'raduga-quick-thought-audio',base64:base64,mimeType:mime});
+        setStatus('Отправлено. Можно вернуться в CRM.','good');
+        setTimeout(()=>window.close(),700);
+      }catch(error){setStatus('Не удалось вернуть запись в CRM: '+error.message,'bad');}
+    };
+    reader.onerror=()=>setStatus('Не удалось прочитать запись.','bad');
+    reader.readAsDataURL(blob);
+  }
+
+  main.addEventListener('click',function(){
+    if(recorder&&recorder.state==='recording'){main.disabled=true;main.textContent='Отправляю…';recorder.stop();return;}
+    start();
+  });
+  retry.addEventListener('click',async function(){try{await ensureMic();setStatus('Микрофон доступен.','good');stopTracks();}catch(error){setStatus('Микрофон недоступен: '+(error&&error.message?error.message:error),'bad');}});
+  cancel.addEventListener('click',function(){try{if(recorder&&recorder.state==='recording')recorder.stop();}catch(e){}stopTracks();window.close();});
+  window.addEventListener('beforeunload',stopTracks);
+  if(!session)setStatus('Нет идентификатора сеанса CRM. Закрой окно и открой запись из CRM ещё раз.','bad');
+})();
+</script>
+</body>
+</html>
