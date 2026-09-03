@@ -13,14 +13,14 @@
 <main><section class="card">
   <div class="mic">🎙</div>
   <h1>Голосовая мысль</h1>
-  <p class="note">Отдельная HTTPS-страница записи. Микрофон запрашивается здесь, вне Google Apps Script.</p>
+  <p class="note">Речь распознаётся прямо в Chrome. Аудиозапись используется только как резерв, если браузер не вернул текст.</p>
   <div id="status" class="status">Готово к записи.</div>
   <div class="actions">
     <button id="main" class="btn primary" type="button">Начать запись</button>
     <button id="cancel" class="btn secondary" type="button">Отмена</button>
     <button id="retry" class="btn secondary" type="button">Проверить микрофон</button>
   </div>
-  <div class="hint">После остановки запись автоматически вернётся в CRM для распознавания. Аудиофайл здесь не сохраняется.</div>
+  <div class="hint">После остановки текст автоматически вернётся в CRM. Аудиофайл нигде не сохраняется.</div>
 </section></main>
 <script>
 (function(){
@@ -32,18 +32,57 @@
   const main=document.getElementById('main');
   const cancel=document.getElementById('cancel');
   const retry=document.getElementById('retry');
-  let stream=null,recorder=null,chunks=[];
+  const SpeechCtor=window.SpeechRecognition||window.webkitSpeechRecognition||null;
+  let stream=null,recorder=null,chunks=[],recognition=null;
+  let recording=false,finalTranscript='',interimTranscript='',speechFailed=false,finishing=false;
 
   function setStatus(text,kind){st.textContent=text;st.className='status '+(kind||'');}
   function stopTracks(){if(stream){try{stream.getTracks().forEach(track=>track.stop());}catch(e){}stream=null;}}
   function targetOrigin(){return /^https:\/\//.test(openerOriginHint)?openerOriginHint:'*';}
   function send(payload){if(!window.opener)throw new Error('CRM-окно не найдено');window.opener.postMessage(Object.assign({session:session},payload),targetOrigin());}
+  function cleanText(value){return String(value||'').replace(/\s+/g,' ').trim();}
 
   async function ensureMic(){
     if(stream&&stream.active)return stream;
     if(!window.isSecureContext||!navigator.mediaDevices||typeof navigator.mediaDevices.getUserMedia!=='function')throw new Error('Браузер не дал защищённый доступ к микрофону');
     stream=await navigator.mediaDevices.getUserMedia({audio:true});
     return stream;
+  }
+
+  function startSpeech(){
+    if(!SpeechCtor)return;
+    speechFailed=false;
+    finalTranscript='';
+    interimTranscript='';
+    try{
+      recognition=new SpeechCtor();
+      recognition.lang='ru-RU';
+      recognition.continuous=true;
+      recognition.interimResults=true;
+      recognition.maxAlternatives=1;
+      recognition.onresult=function(event){
+        let interim='';
+        for(let i=event.resultIndex;i<event.results.length;i+=1){
+          const text=cleanText(event.results[i]&&event.results[i][0]&&event.results[i][0].transcript);
+          if(!text)continue;
+          if(event.results[i].isFinal)finalTranscript=cleanText(finalTranscript+' '+text);
+          else interim=cleanText(interim+' '+text);
+        }
+        interimTranscript=interim;
+        const preview=cleanText(finalTranscript+' '+interimTranscript);
+        if(preview)setStatus('Слышу: '+preview.slice(-180),'good');
+      };
+      recognition.onerror=function(event){
+        const code=String(event&&event.error||'');
+        if(code&&code!=='aborted'&&code!=='no-speech')speechFailed=true;
+      };
+      recognition.onend=function(){
+        if(recording&&!speechFailed){
+          setTimeout(function(){try{recognition&&recognition.start();}catch(e){}},120);
+        }
+      };
+      recognition.start();
+    }catch(error){speechFailed=true;recognition=null;}
   }
 
   async function start(){
@@ -53,45 +92,63 @@
       let options={};
       if(window.MediaRecorder&&MediaRecorder.isTypeSupported&&MediaRecorder.isTypeSupported('audio/webm;codecs=opus'))options={mimeType:'audio/webm;codecs=opus'};
       recorder=Object.keys(options).length?new MediaRecorder(stream,options):new MediaRecorder(stream);
-      chunks=[];
+      chunks=[];finishing=false;recording=true;
       recorder.ondataavailable=e=>{if(e.data&&e.data.size)chunks.push(e.data);};
       recorder.onstop=finish;
       recorder.start();
+      startSpeech();
       main.disabled=false;main.textContent='Остановить и отправить';main.classList.add('recording');
-      setStatus('Запись идёт…','good');
+      setStatus(SpeechCtor?'Запись идёт, Chrome распознаёт речь…':'Запись идёт…','good');
     }catch(error){
-      main.disabled=false;main.textContent='Начать запись';main.classList.remove('recording');
+      recording=false;main.disabled=false;main.textContent='Начать запись';main.classList.remove('recording');
       setStatus('Микрофон недоступен: '+(error&&error.message?error.message:error)+'. Разреши микрофон для этого сайта и повтори.','bad');
     }
   }
 
   function finish(){
+    if(finishing)return;finishing=true;
     const mime=(recorder&&recorder.mimeType)||'audio/webm';
     const blob=new Blob(chunks,{type:mime});
     recorder=null;chunks=[];stopTracks();
-    if(!blob.size){setStatus('Запись пустая. Повтори ещё раз.','bad');return;}
-    setStatus('Возвращаю запись в CRM…','good');
-    const reader=new FileReader();
-    reader.onloadend=function(){
-      const raw=String(reader.result||'');
-      const base64=raw.includes(',')?raw.split(',')[1]:raw;
-      try{
-        send({type:'raduga-quick-thought-audio',base64:base64,mimeType:mime});
-        setStatus('Отправлено. Можно вернуться в CRM.','good');
-        setTimeout(()=>window.close(),700);
-      }catch(error){setStatus('Не удалось вернуть запись в CRM: '+error.message,'bad');}
-    };
-    reader.onerror=()=>setStatus('Не удалось прочитать запись.','bad');
-    reader.readAsDataURL(blob);
+    setStatus('Завершаю распознавание…','good');
+    setTimeout(function(){
+      const text=cleanText(finalTranscript+' '+interimTranscript);
+      if(text){
+        try{
+          send({type:'raduga-quick-thought-text',text:text});
+          setStatus('Текст отправлен в CRM.','good');
+          setTimeout(()=>window.close(),650);
+        }catch(error){setStatus('Не удалось вернуть текст в CRM: '+error.message,'bad');}
+        return;
+      }
+      if(!blob.size){setStatus('Речь не распознана и запись пустая. Повтори ещё раз.','bad');return;}
+      setStatus('Chrome не вернул текст. Отправляю резервную аудиозапись…','');
+      const reader=new FileReader();
+      reader.onloadend=function(){
+        const raw=String(reader.result||'');
+        const base64=raw.includes(',')?raw.split(',')[1]:raw;
+        try{
+          send({type:'raduga-quick-thought-audio',base64:base64,mimeType:mime});
+          setStatus('Резервная запись отправлена в CRM.','good');
+          setTimeout(()=>window.close(),700);
+        }catch(error){setStatus('Не удалось вернуть запись в CRM: '+error.message,'bad');}
+      };
+      reader.onerror=()=>setStatus('Не удалось прочитать резервную запись.','bad');
+      reader.readAsDataURL(blob);
+    },850);
   }
 
-  main.addEventListener('click',function(){
-    if(recorder&&recorder.state==='recording'){main.disabled=true;main.textContent='Отправляю…';recorder.stop();return;}
-    start();
-  });
+  function stopAndSend(){
+    recording=false;
+    main.disabled=true;main.textContent='Отправляю…';
+    try{if(recognition)recognition.stop();}catch(e){}
+    if(recorder&&recorder.state==='recording')recorder.stop();else finish();
+  }
+
+  main.addEventListener('click',function(){if(recording){stopAndSend();return;}start();});
   retry.addEventListener('click',async function(){try{await ensureMic();setStatus('Микрофон доступен.','good');stopTracks();}catch(error){setStatus('Микрофон недоступен: '+(error&&error.message?error.message:error),'bad');}});
-  cancel.addEventListener('click',function(){try{if(recorder&&recorder.state==='recording')recorder.stop();}catch(e){}stopTracks();window.close();});
-  window.addEventListener('beforeunload',stopTracks);
+  cancel.addEventListener('click',function(){recording=false;try{if(recognition)recognition.abort();}catch(e){}try{if(recorder&&recorder.state==='recording')recorder.stop();}catch(e){}stopTracks();window.close();});
+  window.addEventListener('beforeunload',function(){recording=false;try{if(recognition)recognition.abort();}catch(e){}stopTracks();});
   if(!session)setStatus('Нет идентификатора сеанса CRM. Закрой окно и открой запись из CRM ещё раз.','bad');
 })();
 </script>
